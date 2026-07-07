@@ -17,21 +17,25 @@
 
 ## 📋 Overview
 
-This project implements a **hybrid intrusion detection system** that combines:
+This project implements the **Hybrid Certainty Factor–XGBoost** approach from our published paper:
+
+> **Aprianto, A. D., Maharrani, R. H., Auliya, I. C. R., & Alifiah, V. R. (2026).** A Hybrid Certainty Factor–XGBoost Approach for Cyberattack Detection Using the TON_IoT Dataset. *Journal of Information Systems and Informatics*, 8(2), 1519. https://doi.org/10.63158/journalisi.v8i2.1519
+
+It combines three detection methods:
 
 1. **Certainty Factor (CF)** — rule‑based reasoning derived automatically from training data
 2. **XGBoost** — gradient‑boosted decision trees for probabilistic classification
-3. **Hybrid Ensemble** — meta‑model combining CF scores and XGBoost probabilities
+3. **Hybrid Ensemble (meta‑learning)** — meta‑classifier combining CF scores and XGBoost probabilities
 
-The system uses the [**UNSW BoT-IoT / TON-IoT**](https://research.unsw.edu.au/projects/toniot-datasets) network datasets.
+The system uses the [**TON_IoT**](https://research.unsw.edu.au/projects/toniot-datasets) dataset from the University of New South Wales.
 
 ### Why hybrid?
 
-| Approach | Strength | Weakness |
-|---|---|---|
-| CF (rules) | Interpretable, fast, no training | Lower accuracy, manual thresholding |
-| XGBoost | High accuracy, handles feature interactions | Black‑box, needs large data |
-| Hybrid | Best of both — robust, interpretable via SHAP later | More complex pipeline |
+| Approach | Accuracy (paper) | Strength | Weakness |
+|---|---|---|---|
+| CF (rules) | 76.31% | Interpretable, fast, no training | Lower accuracy, manual thresholding |
+| XGBoost | 99.61% | High accuracy, handles feature interactions | Black‑box, needs large data |
+| Hybrid CF–XGBoost | 99.42% | High accuracy + interpretable rules | Slightly more complex pipeline |
 
 ---
 
@@ -185,5 +189,6 @@ MIT — see [LICENSE](LICENSE) for details.
 
 ## 📚 References
 
+- **Aprianto, A. D., Maharrani, R. H., Auliya, I. C. R., & Alifiah, V. R. (2026).** A Hybrid Certainty Factor–XGBoost Approach for Cyberattack Detection Using the TON_IoT Dataset. *Journal of Information Systems and Informatics*, 8(2), 1519. https://doi.org/10.63158/journalisi.v8i2.1519
 - Moustafa, N. (2021). *TON‑IoT: The Role of Heterogeneity and the Impact of the Interdisciplinary Nature of Cybersecurity*. IEEE.
 - [UNSW TON‑IoT Datasets](https://research.unsw.edu.au/projects/toniot-datasets)

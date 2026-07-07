@@ -1,14 +1,19 @@
 """
-Network Anomaly Detection System
-=================================
+Hybrid Certainty Factor–XGBoost for Cyberattack Detection
+=========================================================
 
-Hybrid approach: Certainty Factor (CF) + XGBoost + Ensemble
+Implementation of:
 
-Combines rule-based reasoning (CF) with gradient boosting (XGBoost)
-for network intrusion detection using the UNSW/BoT-IoT dataset.
+    Aprianto, A. D., Maharrani, R. H., Auliya, I. C. R., & Alifiah, V. R. (2026).
+    A Hybrid Certainty Factor–XGBoost Approach for Cyberattack Detection Using
+    the TON_IoT Dataset. Journal of Information Systems and Informatics, 8(2), 1519.
+    https://doi.org/10.63158/journalisi.v8i2.1519
+
+Combines rule-based reasoning (Certainty Factor) with gradient boosting (XGBoost)
+via meta-learning for network intrusion detection on the TON_IoT dataset.
 
 Usage:
-    python akurasi.py [--dataset path/to/data.csv] [--test-size 0.2]
+    python akurasi.py --dataset path/to/data.csv [--test-size 0.2] [--output output/]
 
 Author: cyberforge-sec
 License: MIT
