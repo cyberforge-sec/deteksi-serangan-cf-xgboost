@@ -24,11 +24,9 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import re
 import sys
-import traceback
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import partial
 from multiprocessing import Pool, cpu_count
 from pathlib import Path
@@ -50,7 +48,7 @@ from sklearn.metrics import (
     roc_curve,
 )
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.preprocessing import LabelEncoder
 from tqdm import tqdm
 from xgboost import XGBClassifier, plot_importance
 
@@ -109,7 +107,6 @@ XGB_PARAMS: Dict[str, Any] = {
     "colsample_bytree": 0.8,
     "random_state": 42,
     "eval_metric": "logloss",
-    "use_label_encoder": False,
     "tree_method": "hist",
     "gamma": 0.1,
     "reg_alpha": 0.5,
@@ -122,7 +119,6 @@ HYBRID_PARAMS: Dict[str, Any] = {
     "learning_rate": 0.05,
     "random_state": 42,
     "eval_metric": "logloss",
-    "use_label_encoder": False,
     "subsample": 0.7,
     "colsample_bytree": 0.7,
 }
@@ -213,13 +209,32 @@ class CFEngine:
             log.warning("Only one class present — cannot build discriminative rules")
             return cls(rules=[])
 
-        def _mb_md(feature: str, value: Any) -> Tuple[float, float]:
+        def _mb_md_cat(feature: str, value: Any) -> Tuple[float, float]:
+            """MB/MD for categorical equality (feature == value)."""
             hit_feature = len(df[df[feature] == value])
             hit_attack = len(attack[attack[feature] == value])
             hit_normal = len(normal[normal[feature] == value])
 
             if hit_feature == 0:
                 return 0.0, 0.0
+
+            p_attack = hit_attack / len(attack)
+            p_normal = hit_normal / len(normal)
+
+            mb = max(0.0, (p_attack - p_normal)) / (p_attack + p_normal + 1e-9)
+            md = max(0.0, (p_normal - p_attack)) / (p_attack + p_normal + 1e-9)
+
+            return min(mb, 1.0), min(md, 1.0)
+
+        def _mb_md_num(feature: str, op: str, threshold: float) -> Tuple[float, float]:
+            """MB/MD for numeric range (feature < threshold or feature > threshold)."""
+            if op == "<":
+                mask = df[feature] < threshold
+            else:
+                mask = df[feature] > threshold
+
+            hit_attack = mask[attack.index].sum()
+            hit_normal = mask[normal.index].sum()
 
             p_attack = hit_attack / len(attack)
             p_normal = hit_normal / len(normal)
@@ -236,7 +251,7 @@ class CFEngine:
             for value, count in df[col].value_counts().items():
                 if count / total < min_support:
                     continue
-                mb, md = _mb_md(col, value)
+                mb, md = _mb_md_cat(col, value)
                 confidence = mb / (mb + md + 1e-9)
                 if confidence >= min_confidence and (mb > CF_MB_MD_THRESHOLD or md > CF_MB_MD_THRESHOLD):
                     rules.append(CFRule.from_string(col, f"{col} == '{value}'", mb, md))
@@ -247,11 +262,13 @@ class CFEngine:
                 continue
             q_low, q_high = df[col].quantile(0.05), df[col].quantile(0.95)
 
-            mb_low, md_low = _mb_md(col, q_low)
-            rules.append(CFRule.from_string(col, f"{col} < {q_low}", md_low, mb_low))
+            mb_low, md_low = _mb_md_num(col, "<", q_low)
+            if max(mb_low, md_low) > 0.1:
+                rules.append(CFRule.from_string(col, f"{col} < {q_low}", md_low, mb_low))
 
-            mb_high, md_high = _mb_md(col, q_high)
-            rules.append(CFRule.from_string(col, f"{col} > {q_high}", mb_high, md_high))
+            mb_high, md_high = _mb_md_num(col, ">", q_high)
+            if max(mb_high, md_high) > 0.1:
+                rules.append(CFRule.from_string(col, f"{col} > {q_high}", mb_high, md_high))
 
         log.info("Built %d CF rules from training data", len(rules))
         return cls(rules=rules)
@@ -662,13 +679,13 @@ def main() -> None:
     parser.add_argument(
         "--dataset", "-d",
         default="train_test_network.csv",
-        help="Path to training CSV dataset (default: train_test_network.csv)",
+        help="Path to the full dataset CSV (will be split into train/test). Default: train_test_network.csv",
     )
     parser.add_argument(
         "--test-size", "-t",
         type=float,
         default=0.2,
-        help="Fraction of data held out for final evaluation (default: 0.2)",
+        help="Fraction held out as test set (default: 0.2). The rest is used for training.",
     )
     parser.add_argument(
         "--output", "-o",
@@ -742,10 +759,10 @@ def main() -> None:
         log.info("Saved %d rules to basis_pengetahuan_otomatis.csv", len(rules_df))
 
     # 5. CF scoring (train + test) -------------------------------------------
-    with log.info("Scoring training set with CF..."):
-        df_train["cf_score"] = cf_engine.score_bulk(df_train)
-    with log.info("Scoring test set with CF..."):
-        df_test["cf_score"] = cf_engine.score_bulk(df_test)
+    log.info("Scoring training set with CF...")
+    df_train["cf_score"] = cf_engine.score_bulk(df_train)
+    log.info("Scoring test set with CF...")
+    df_test["cf_score"] = cf_engine.score_bulk(df_test)
 
     # Adaptive thresholds from TRAIN scores only
     thresholds = RiskThresholds.from_scores(df_train["cf_score"].values)
@@ -796,12 +813,11 @@ def main() -> None:
     print_metrics(metrics_xgb)
     plot_confusion_matrix(y_test, metrics_xgb["y_pred"], "XGBoost", str(output_dir / "xgb_confusion_matrix.png"))
 
-    # Hybrid
-    if hybrid_model is not None:
-        log.info("")
-        metrics_h = evaluate_model(y_test, df_test["prob_hybrid"], "Hybrid")
-        print_metrics(metrics_h)
-        plot_confusion_matrix(y_test, metrics_h["y_pred"], "Hybrid", str(output_dir / "hybrid_confusion_matrix.png"))
+    # Hybrid — always available, trained unconditionally above
+    log.info("")
+    metrics_h = evaluate_model(y_test, df_test["prob_hybrid"], "Hybrid")
+    print_metrics(metrics_h)
+    plot_confusion_matrix(y_test, metrics_h["y_pred"], "Hybrid", str(output_dir / "hybrid_confusion_matrix.png"))
 
     # Shared plots
     plot_cf_distribution(df_test, thresholds, str(output_dir / "cf_distribution.png"))
