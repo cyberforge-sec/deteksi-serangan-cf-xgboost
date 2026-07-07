@@ -190,5 +190,7 @@ MIT — see [LICENSE](LICENSE) for details.
 ## 📚 References
 
 - **Aprianto, A. D., Maharrani, R. H., Auliya, I. C. R., & Alifiah, V. R. (2026).** A Hybrid Certainty Factor–XGBoost Approach for Cyberattack Detection Using the TON_IoT Dataset. *Journal of Information Systems and Informatics*, 8(2), 1519. https://doi.org/10.63158/journalisi.v8i2.1519
-- Moustafa, N. (2021). *TON‑IoT: The Role of Heterogeneity and the Impact of the Interdisciplinary Nature of Cybersecurity*. IEEE.
+- Booij, T. M., Chiscop, I., Meeuwissen, E., Moustafa, N., & den Hartog, F. T. H. (2021). ToN IoT — The Role of Heterogeneity and the Need for Standardization of Features and Attack Types in IoT Network Intrusion Datasets. *IEEE Internet of Things Journal*.
+- Alsaedi, A., Moustafa, N., Tari, Z., Mahmood, A., & Anwar, A. (2020). TON_IoT Telemetry Dataset: A New Generation Dataset of IoT and IIoT for Data-Driven Intrusion Detection Systems. *IEEE Access*, 8, 165130-165150.
+- Moustafa, N. (2021). A New Distributed Architecture for Evaluating AI-Based Security Systems at the Edge: Network TON_IoT Datasets. *Sustainable Cities and Society*, 102994.
 - [UNSW TON‑IoT Datasets](https://research.unsw.edu.au/projects/toniot-datasets)
