@@ -1,809 +1,826 @@
-import pandas as pd
-import numpy as np
-from tqdm import tqdm
-from sklearn.metrics import (accuracy_score, confusion_matrix,
-                           classification_report, roc_curve, auc,
-                           precision_recall_curve, f1_score,
-                           balanced_accuracy_score, matthews_corrcoef)
-from multiprocessing import Pool, cpu_count
-from functools import partial
-import traceback
-import matplotlib.pyplot as plt
-import seaborn as sns
-import warnings
-from sklearn.cluster import KMeans
-from sklearn.model_selection import train_test_split, cross_val_score
-from sklearn.preprocessing import LabelEncoder, StandardScaler
-from xgboost import XGBClassifier, plot_importance
-import argparse
-import os
+"""
+Network Anomaly Detection System
+=================================
 
-# Filter warnings
+Hybrid approach: Certainty Factor (CF) + XGBoost + Ensemble
+
+Combines rule-based reasoning (CF) with gradient boosting (XGBoost)
+for network intrusion detection using the UNSW/BoT-IoT dataset.
+
+Usage:
+    python akurasi.py [--dataset path/to/data.csv] [--test-size 0.2]
+
+Author: cyberforge-sec
+License: MIT
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import re
+import sys
+import traceback
+import warnings
+from dataclasses import dataclass, field
+from functools import partial
+from multiprocessing import Pool, cpu_count
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+from sklearn.cluster import KMeans
+from sklearn.metrics import (
+    accuracy_score,
+    auc,
+    balanced_accuracy_score,
+    classification_report,
+    confusion_matrix,
+    matthews_corrcoef,
+    precision_recall_curve,
+    roc_curve,
+)
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from tqdm import tqdm
+from xgboost import XGBClassifier, plot_importance
+
 warnings.filterwarnings("ignore", category=FutureWarning)
 
-# Setup visualisasi
-plt.style.use('seaborn-v0_8')
-plt.rcParams['font.family'] = 'DejaVu Sans'
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Plotting setup
+# ---------------------------------------------------------------------------
+
+plt.style.use("seaborn-v0_8")
+plt.rcParams["font.family"] = "DejaVu Sans"
 sns.set_palette("husl")
 
-# --- Module-level function for multiprocessing ---
-# (must be at module level so multiprocessing can pickle it across workers)
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+LABEL_ATTACK_VALUES = {"attack", "malicious", "1", "true", "anomaly"}
+
+COLUMNS_TO_DROP = [
+    "src_ip", "dst_ip", "dns_query", "ssl_subject", "ssl_issuer",
+    "http_user_agent", "weird_name", "weird_addl", "type", "dns_qclass",
+]
+
+NUMERIC_COLUMNS = ["duration", "src_bytes", "dst_bytes", "dns_qtype"]
+
+CATEGORICAL_COLUMNS = [
+    "conn_state", "proto", "service", "http_status_code",
+    "weird_notice", "http_method", "ssl_resumed", "http_uri",
+]
+
+# CF engine defaults
+CF_MIN_SUPPORT = 0.05
+CF_MIN_CONFIDENCE = 0.6
+CF_MB_MD_THRESHOLD = 0.8
+CF_MAX_ACTIVE_RULES = 10
+
+# XGBoost defaults
+XGB_PARAMS: Dict[str, Any] = {
+    "n_estimators": 100,
+    "max_depth": 3,
+    "learning_rate": 0.1,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "random_state": 42,
+    "eval_metric": "logloss",
+    "use_label_encoder": False,
+    "tree_method": "hist",
+    "gamma": 0.1,
+    "reg_alpha": 0.5,
+    "reg_lambda": 1,
+}
+
+HYBRID_PARAMS: Dict[str, Any] = {
+    "n_estimators": 50,
+    "max_depth": 2,
+    "learning_rate": 0.05,
+    "random_state": 42,
+    "eval_metric": "logloss",
+    "use_label_encoder": False,
+    "subsample": 0.7,
+    "colsample_bytree": 0.7,
+}
+
+OUTPUT_DIR = Path("output")
 
 
-def _proses_chunk(args):
-    """Module-level helper for multiprocessing. Processes a chunk of rows."""
-    chunk_dicts, df_gejala_dicts = args
-    detektor = CFSkorCalculator(df_gejala_dicts)
-    return [detektor.hitung_cf(row) for row in chunk_dicts]
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
 
+@dataclass
+class CFRule:
+    """A single Certainty Factor rule extracted from data."""
 
-class CFSkorCalculator:
-    """Helper class that holds rule data for CF computation.
+    column: str
+    operator: str          # "==" | "<" | ">"
+    value: Any
+    mb: float              # measure of belief
+    md: float              # measure of disbelief
 
-    This exists solely so we can pickle it across multiprocessing workers
-    without carrying the entire SistemDeteksiAnomali instance.
-    """
+    @classmethod
+    def from_string(cls, column: str, kondisi: str, mb: float, md: float) -> "CFRule":
+        """Parse a condition string and create a rule."""
+        if " == " in kondisi:
+            parts = kondisi.split(" == ")
+            val = parts[1].strip().strip("'\"")
+            return cls(column=column, operator="==", value=val, mb=mb, md=md)
+        elif " < " in kondisi:
+            parts = kondisi.split(" < ")
+            return cls(column=column, operator="<", value=float(parts[1].strip()), mb=mb, md=md)
+        elif " > " in kondisi:
+            parts = kondisi.split(" > ")
+            return cls(column=column, operator=">", value=float(parts[1].strip()), mb=mb, md=md)
+        else:
+            raise ValueError(f"Unrecognized condition format: {kondisi}")
 
-    def __init__(self, df_gejala_dicts):
-        # Convert list of dicts back to DataFrame internally
-        self.df_gejala = pd.DataFrame(df_gejala_dicts) if df_gejala_dicts else None
+    def evaluate(self, row: Dict[str, Any]) -> bool:
+        """Test if this rule's condition is satisfied by a row dict."""
+        if self.column not in row or pd.isna(row[self.column]):
+            return False
 
-    def hitung_cf(self, row_dict):
-        """Menghitung Certainty Factor untuk satu baris - tanpa eval()."""
-        if self.df_gejala is None or len(self.df_gejala) == 0:
-            return 0.0
-
-        total_cf = 0.0
-        gejala_aktif = 0
-
-        for _, gejala in self.df_gejala.iterrows():
-            try:
-                kolom = gejala['kolom']
-                kondisi_str = gejala['kondisi']
-                mb = gejala['mb']
-                md = gejala['md']
-
-                if kolom not in row_dict or pd.isna(row_dict[kolom]):
-                    continue
-
-                nilai = row_dict[kolom]
-                kondisi_terpenuhi = False
-
-                # --- Safe condition evaluation (no eval()) ---
-                if ' == ' in kondisi_str:
-                    # Format: "kolom == 'value'"
-                    parts = kondisi_str.split(' == ')
-                    value_part = parts[1].strip().strip("'\"")
-                    kondisi_terpenuhi = str(nilai).strip().lower() == value_part.lower()
-
-                elif ' < ' in kondisi_str:
-                    # Format: "kolom < threshold"
-                    try:
-                        parts = kondisi_str.split(' < ')
-                        threshold = float(parts[1].strip())
-                        kondisi_terpenuhi = pd.to_numeric(nilai, errors='coerce') < threshold
-                    except (ValueError, TypeError):
-                        kondisi_terpenuhi = False
-
-                elif ' > ' in kondisi_str:
-                    # Format: "kolom > threshold"
-                    try:
-                        parts = kondisi_str.split(' > ')
-                        threshold = float(parts[1].strip())
-                        kondisi_terpenuhi = pd.to_numeric(nilai, errors='coerce') > threshold
-                    except (ValueError, TypeError):
-                        kondisi_terpenuhi = False
-
-                if kondisi_terpenuhi:
-                    cf = mb - md
-                    if abs(total_cf) < 0.001:
-                        total_cf = cf
-                    else:
-                        total_cf += cf * (1 - abs(total_cf))
-                    gejala_aktif += 1
-
-            except Exception:
-                continue
-
-        # Batasi maksimal 10 aturan yang berpengaruh
-        if gejala_aktif > 0:
-            total_cf = total_cf / min(gejala_aktif, 10)
-
-        # Gunakan fungsi sigmoid untuk normalisasi
-        return 1 / (1 + np.exp(-5 * total_cf))
-
-
-class SistemDeteksiAnomali:
-    def __init__(self):
-        self.df_gejala = None
-        self.thresholds = {'rendah': 0.3, 'sedang': 0.7}
-        self.xgb_model = None
-        self.hybrid_model = None
-        self.label_encoders = {}
-        self.scaler = StandardScaler()
-        self.fitur_dihapus = []
-
-    def muat_data(self, file_data):
-        """Memuat data dan melakukan preprocessing"""
-        print(f"📥 Memuat dataset dari {file_data}...")
-
-        if not os.path.exists(file_data):
-            print(f"❌ File tidak ditemukan: {file_data}")
-            return None
+        nilai = row[self.column]
 
         try:
-            df = pd.read_csv(file_data)
-            print(f"✅ Dataset dimuat ({len(df)} baris, {len(df.columns)} kolom)")
-            return df
-        except Exception as e:
-            print(f"❌ Gagal memuat dataset: {str(e)}")
-            return None
+            if self.operator == "==":
+                return str(nilai).strip().lower() == str(self.value).strip().lower()
+            elif self.operator == "<":
+                return pd.to_numeric(nilai, errors="coerce") < self.value
+            elif self.operator == ">":
+                return pd.to_numeric(nilai, errors="coerce") > self.value
+        except (ValueError, TypeError):
+            return False
 
-    def praproses_data(self, df):
-        """Melakukan preprocessing data"""
-        print("\n🧹 Memulai preprocessing data...")
+        return False
 
-        # Drop columns yang tidak digunakan (pertahankan 'label')
-        cols_to_drop = ['src_ip', 'dst_ip', 'dns_query', 'ssl_subject', 'ssl_issuer',
-                       'http_user_agent', 'weird_name', 'weird_addl', 'type',
-                       'dns_qclass']
-        cols_existing = [col for col in cols_to_drop if col in df.columns]
-        if cols_existing:
-            df = df.drop(cols_existing, axis=1)
-            print(f"  - Menghapus {len(cols_existing)} kolom yang tidak digunakan")
 
-        # Proses kolom numerik
-        kolom_numerik = ['duration', 'src_bytes', 'dst_bytes', 'dns_qtype']
-        for col in kolom_numerik:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-                df[col] = df[col].replace([np.inf, -np.inf], np.nan)
+# ---------------------------------------------------------------------------
+# CF Engine
+# ---------------------------------------------------------------------------
 
-                if df[col].max() > 1e6:
-                    df[col] = np.log1p(df[col])
-                    print(f"  - Log-normalisasi {col}")
+class CFEngine:
+    """
+    Certainty Factor inference engine.
 
-                df[col] = df[col].fillna(0)
+    Computes CF scores from a set of rules against data rows.
+    Thread-safe: rules are read-only after construction.
+    """
 
-        print(f"  - {len([c for c in kolom_numerik if c in df.columns])} kolom numerik diproses")
+    def __init__(self, rules: List[CFRule]):
+        self.rules = rules
 
-        # Proses kolom kategorikal
-        kolom_kategorikal = ['conn_state', 'proto', 'service', 'http_status_code',
-                           'weird_notice', 'http_method', 'ssl_resumed', 'http_uri']
-        for col in kolom_kategorikal:
-            if col in df.columns:
-                df[col] = df[col].astype(str).str.strip().str.lower()
-                df[col] = df[col].replace('nan', 'unknown')
+    @classmethod
+    def build_from_data(
+        cls,
+        df: pd.DataFrame,
+        label_col: str = "label_binary",
+        min_support: float = CF_MIN_SUPPORT,
+        min_confidence: float = CF_MIN_CONFIDENCE,
+    ) -> "CFEngine":
+        """Automatically extract CF rules from labelled training data."""
+        rules: List[CFRule] = []
+        total = len(df)
+        attack = df[df[label_col] == 1]
+        normal = df[df[label_col] == 0]
 
-        print(f"  - {len([c for c in kolom_kategorikal if c in df.columns])} kolom kategorikal diproses")
+        if len(attack) == 0 or len(normal) == 0:
+            log.warning("Only one class present — cannot build discriminative rules")
+            return cls(rules=[])
 
-        # Tambahkan fitur baru
-        if 'src_bytes' in df.columns and 'dst_bytes' in df.columns:
-            df['bytes_ratio'] = np.log1p(df['src_bytes'] / (df['dst_bytes'] + 1))
-        if 'duration' in df.columns and 'src_bytes' in df.columns and 'dst_bytes' in df.columns:
-            df['packet_rate'] = df['duration'] / (df['src_bytes'] + df['dst_bytes'] + 1)
-        print("  - Fitur baru: bytes_ratio, packet_rate")
+        def _mb_md(feature: str, value: Any) -> Tuple[float, float]:
+            hit_feature = len(df[df[feature] == value])
+            hit_attack = len(attack[attack[feature] == value])
+            hit_normal = len(normal[normal[feature] == value])
 
-        return df
-
-    def bangun_basis_pengetahuan(self, df, min_support=0.05, min_confidence=0.6):
-        """Membangun basis pengetahuan secara otomatis dari data"""
-        print("\n🔍 Membangun basis pengetahuan gejala secara otomatis...")
-        basis_pengetahuan = []
-
-        if 'label_binary' not in df.columns:
-            if 'label' not in df.columns:
-                print("❌ Kolom 'label' tidak ditemukan")
-                return
-
-            df['label_binary'] = df['label'].apply(
-                lambda x: 1 if str(x).lower() in ['attack', 'malicious', '1', 'true'] else 0)
-
-        total_records = len(df)
-        attack_records = df[df['label_binary'] == 1]
-        normal_records = df[df['label_binary'] == 0]
-
-        if len(attack_records) == 0 or len(normal_records) == 0:
-            print("⚠️ Data hanya memiliki satu kelas — tidak bisa membangun aturan diskriminatif")
-            self.df_gejala = pd.DataFrame()
-            return
-
-        def hitung_mb_md(feature, value):
-            total_feature = len(df[df[feature] == value])
-            attack_feature = len(attack_records[attack_records[feature] == value])
-            normal_feature = len(normal_records[normal_records[feature] == value])
-
-            if total_feature == 0:
+            if hit_feature == 0:
                 return 0.0, 0.0
 
-            p_attack = attack_feature / len(attack_records) if len(attack_records) > 0 else 0
-            p_normal = normal_feature / len(normal_records) if len(normal_records) > 0 else 0
+            p_attack = hit_attack / len(attack)
+            p_normal = hit_normal / len(normal)
 
-            mb = max(0, (p_attack - p_normal)) / (p_attack + p_normal + 1e-9)
-            md = max(0, (p_normal - p_attack)) / (p_attack + p_normal + 1e-9)
+            mb = max(0.0, (p_attack - p_normal)) / (p_attack + p_normal + 1e-9)
+            md = max(0.0, (p_normal - p_attack)) / (p_attack + p_normal + 1e-9)
 
             return min(mb, 1.0), min(md, 1.0)
 
-        kolom_kategorikal = ['conn_state', 'proto', 'service', 'http_status_code',
-                           'weird_notice', 'http_method', 'ssl_resumed', 'http_uri']
-
-        for kolom in kolom_kategorikal:
-            if kolom not in df.columns:
+        # Categorical rules
+        for col in CATEGORICAL_COLUMNS:
+            if col not in df.columns:
                 continue
-
-            unique_values = df[kolom].value_counts()
-            for value, count in unique_values.items():
-                support = count / total_records
-                if support < min_support:
+            for value, count in df[col].value_counts().items():
+                if count / total < min_support:
                     continue
-
-                mb, md = hitung_mb_md(kolom, value)
+                mb, md = _mb_md(col, value)
                 confidence = mb / (mb + md + 1e-9)
+                if confidence >= min_confidence and (mb > CF_MB_MD_THRESHOLD or md > CF_MB_MD_THRESHOLD):
+                    rules.append(CFRule.from_string(col, f"{col} == '{value}'", mb, md))
 
-                if confidence >= min_confidence and (mb > 0.8 or md > 0.8):
-                    basis_pengetahuan.append({
-                        'kolom': kolom,
-                        'kondisi': f"{kolom} == '{value}'",
-                        'mb': mb,
-                        'md': md
-                    })
-
-        kolom_numerik = ['duration', 'src_bytes', 'dst_bytes', 'dns_qtype',
-                        'bytes_ratio', 'packet_rate']
-
-        for kolom in kolom_numerik:
-            if kolom not in df.columns:
+        # Numeric rules (quantile-based)
+        for col in ["duration", "src_bytes", "dst_bytes", "dns_qtype", "bytes_ratio", "packet_rate"]:
+            if col not in df.columns:
                 continue
+            q_low, q_high = df[col].quantile(0.05), df[col].quantile(0.95)
 
-            q_low = df[kolom].quantile(0.05)
-            q_high = df[kolom].quantile(0.95)
+            mb_low, md_low = _mb_md(col, q_low)
+            rules.append(CFRule.from_string(col, f"{col} < {q_low}", md_low, mb_low))
 
-            mb_low, md_low = hitung_mb_md(kolom, q_low)
-            basis_pengetahuan.append({
-                'kolom': kolom,
-                'kondisi': f"{kolom} < {q_low}",
-                'mb': md_low,
-                'md': mb_low
-            })
+            mb_high, md_high = _mb_md(col, q_high)
+            rules.append(CFRule.from_string(col, f"{col} > {q_high}", mb_high, md_high))
 
-            mb_high, md_high = hitung_mb_md(kolom, q_high)
-            basis_pengetahuan.append({
-                'kolom': kolom,
-                'kondisi': f"{kolom} > {q_high}",
-                'mb': mb_high,
-                'md': md_high
-            })
+        log.info("Built %d CF rules from training data", len(rules))
+        return cls(rules=rules)
 
-        self.df_gejala = pd.DataFrame(basis_pengetahuan)
-        print(f"✅ Basis pengetahuan dibangun: {len(self.df_gejala)} aturan")
-
-        self.df_gejala.to_csv('basis_pengetahuan_otomatis.csv', index=False)
-        print("💾 Disimpan sebagai 'basis_pengetahuan_otomatis.csv'")
-
-    def hitung_cf(self, row_dict):
-        """Menghitung Certainty Factor untuk satu baris tanpa eval()."""
-        if self.df_gejala is None or len(self.df_gejala) == 0:
+    def score_row(self, row: Dict[str, Any]) -> float:
+        """Compute combined CF score for a single row (0..1)."""
+        if not self.rules:
             return 0.0
 
         total_cf = 0.0
-        gejala_aktif = 0
+        active = 0
 
-        for _, gejala in self.df_gejala.iterrows():
-            try:
-                kolom = gejala['kolom']
-                kondisi_str = gejala['kondisi']
-                mb = gejala['mb']
-                md = gejala['md']
-
-                if kolom not in row_dict or pd.isna(row_dict[kolom]):
-                    continue
-
-                nilai = row_dict[kolom]
-                kondisi_terpenuhi = self._evaluasi_kondisi_safe(kondisi_str, kolom, nilai)
-
-                if kondisi_terpenuhi:
-                    cf = mb - md
-                    if abs(total_cf) < 0.001:
-                        total_cf = cf
-                    else:
-                        total_cf += cf * (1 - abs(total_cf))
-                    gejala_aktif += 1
-            except Exception:
+        for rule in self.rules:
+            if not rule.evaluate(row):
                 continue
 
-        if gejala_aktif > 0:
-            total_cf = total_cf / min(gejala_aktif, 10)
-
-        return 1 / (1 + np.exp(-5 * total_cf))
-
-    def _evaluasi_kondisi_safe(self, kondisi_str, kolom, nilai):
-        """Evaluasi kondisi string tanpa eval() — hanya dukung ==, <, >."""
-        try:
-            if ' == ' in kondisi_str:
-                parts = kondisi_str.split(' == ')
-                value_part = parts[1].strip().strip("'\"")
-                return str(nilai).strip().lower() == value_part.lower()
-
-            elif ' < ' in kondisi_str:
-                parts = kondisi_str.split(' < ')
-                threshold = float(parts[1].strip())
-                return pd.to_numeric(nilai, errors='coerce') < threshold
-
-            elif ' > ' in kondisi_str:
-                parts = kondisi_str.split(' > ')
-                threshold = float(parts[1].strip())
-                return pd.to_numeric(nilai, errors='coerce') > threshold
-        except (ValueError, TypeError):
-            pass
-
-        return False
-
-    def hitung_cf_paralel(self, df):
-        """Menghitung CF secara paralel"""
-        print("\n⚡ Menghitung skor CF dengan multiprocessing...")
-
-        try:
-            num_cores = max(1, cpu_count() - 1)
-            chunk_size = max(1, len(df) // (num_cores * 10))
-            chunks = [df.iloc[i:i + chunk_size].copy() for i in range(0, len(df), chunk_size)]
-
-            print(f"  - {num_cores} core CPU, {len(chunks)} chunk")
-
-            # Convert df_gejala to plain dicts for pickling
-            df_gejala_dicts = self.df_gejala.to_dict('records') if self.df_gejala is not None else []
-
-            # Prepare args: (chunk_dicts, df_gejala_dicts)
-            chunk_dicts_list = [chunk.to_dict('records') for chunk in chunks]
-
-            skor_cf = []
-            with Pool(num_cores) as pool:
-                with tqdm(total=len(chunks), desc="CF Score") as pbar:
-                    for result in pool.imap_unordered(
-                        _proses_chunk,
-                        [(cd, df_gejala_dicts) for cd in chunk_dicts_list]
-                    ):
-                        skor_cf.extend(result)
-                        pbar.update()
-
-            return np.array(skor_cf)
-        except Exception as e:
-            print(f"⚠️ Parallel processing gagal: {str(e)}")
-            print("🔄 Fallback ke mode sequential...")
-            return self._hitung_cf_sequential(df)
-
-    def _hitung_cf_sequential(self, df):
-        """Fallback sequential CF computation"""
-        print("  - Menghitung CF secara sequential...")
-        skor = []
-        for _, row in tqdm(df.iterrows(), total=len(df), desc="CF Sequential"):
-            skor.append(self.hitung_cf(row.to_dict()))
-        return np.array(skor)
-
-    def tentukan_threshold(self, skor_cf):
-        """Menentukan threshold adaptif dengan KMeans"""
-        print("\n📊 Menentukan threshold adaptif...")
-
-        try:
-            skor_array = np.array(skor_cf).reshape(-1, 1)
-            unique_values = np.unique(skor_array)
-
-            if len(unique_values) < 3:
-                print(f"⚠️ Data hanya memiliki {len(unique_values)} nilai unik — fallback ke threshold default")
-                self.thresholds = {'rendah': 0.3, 'sedang': 0.7}
-                return False
-
-            n_clusters = min(3, len(unique_values))
-            kmeans = KMeans(n_clusters=n_clusters, n_init=10, random_state=42).fit(skor_array)
-            centers = sorted(kmeans.cluster_centers_.flatten())
-
-            if len(centers) >= 3:
-                self.thresholds['rendah'] = centers[0] + (centers[1] - centers[0]) * 0.4
-                self.thresholds['sedang'] = centers[1] + (centers[2] - centers[1]) * 0.6
-            elif len(centers) == 2:
-                self.thresholds['rendah'] = centers[0] + (centers[1] - centers[0]) * 0.3
-                self.thresholds['sedang'] = centers[0] + (centers[1] - centers[0]) * 0.7
+            cf = rule.mb - rule.md
+            if abs(total_cf) < 1e-6:
+                total_cf = cf
             else:
-                self.thresholds = {'rendah': 0.3, 'sedang': 0.7}
+                total_cf += cf * (1 - abs(total_cf))
+            active += 1
 
-            print(f"✅ Threshold: Rendah={self.thresholds['rendah']:.3f}, Sedang={self.thresholds['sedang']:.3f}")
-            return True
-        except Exception as e:
-            print(f"⚠️ Gagal menentukan threshold adaptif: {str(e)}")
-            self.thresholds = {'rendah': 0.3, 'sedang': 0.7}
-            return False
+        if active > 0:
+            total_cf /= min(active, CF_MAX_ACTIVE_RULES)
 
-    def klasifikasi_risiko(self, skor):
-        buffer = 0.05
-        if skor < (self.thresholds['rendah'] - buffer):
-            return 'rendah'
-        elif (self.thresholds['rendah'] + buffer) <= skor < (self.thresholds['sedang'] - buffer):
-            return 'sedang'
-        elif skor >= (self.thresholds['sedang'] + buffer):
-            return 'tinggi'
+        # Sigmoid normalization
+        return float(1.0 / (1.0 + np.exp(-5.0 * total_cf)))
+
+    def score_bulk(self, df: pd.DataFrame, n_jobs: Optional[int] = None) -> np.ndarray:
+        """
+        Score all rows, optionally using multiprocessing.
+
+        Falls back to sequential on error (e.g., pickling issues).
+        """
+        if not self.rules:
+            return np.zeros(len(df))
+
+        if n_jobs is None:
+            n_jobs = max(1, cpu_count() - 1)
+
+        try:
+            return self._score_parallel(df, n_jobs)
+        except Exception as exc:
+            log.warning("Parallel scoring failed (%s), falling back to sequential", exc)
+            return self._score_sequential(df)
+
+    def _score_sequential(self, df: pd.DataFrame) -> np.ndarray:
+        """Score rows one by one."""
+        scores = []
+        for _, row in tqdm(df.iterrows(), total=len(df), desc="CF sequential"):
+            scores.append(self.score_row(row.to_dict()))
+        return np.array(scores)
+
+    def _score_parallel(self, df: pd.DataFrame, n_jobs: int) -> np.ndarray:
+        """Score rows in parallel chunks."""
+        chunk_size = max(1, len(df) // (n_jobs * 10))
+        chunks = [df.iloc[i:i + chunk_size] for i in range(0, len(df), chunk_size)]
+
+        log.info("Scoring %d rows with %d workers (%d chunks)", len(df), n_jobs, len(chunks))
+
+        # Serialise rules once — avoids pickling the whole engine
+        rule_dicts = [{"col": r.column, "op": r.operator, "val": r.value, "mb": r.mb, "md": r.md}
+                       for r in self.rules]
+
+        scores: List[float] = []
+        with Pool(n_jobs) as pool:
+            worker = partial(_score_chunk, rule_dicts)
+            for result in tqdm(pool.imap_unordered(worker, chunks), total=len(chunks), desc="CF parallel"):
+                scores.extend(result)
+
+        return np.array(scores)
+
+
+def _score_chunk(rule_dicts: List[Dict[str, Any]], chunk: pd.DataFrame) -> List[float]:
+    """Worker function for multiprocessing — module-level so it's pickleable."""
+    rules = [
+        CFRule(column=r["col"], operator=r["op"], value=r["val"], mb=r["mb"], md=r["md"])
+        for r in rule_dicts
+    ]
+    engine = CFEngine(rules)
+    return [engine.score_row(row.to_dict()) for _, row in chunk.iterrows()]
+
+
+# ---------------------------------------------------------------------------
+# Adaptive Threshold (KMeans-based)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RiskThresholds:
+    low: float = 0.3
+    medium: float = 0.7
+
+    @classmethod
+    def from_scores(cls, scores: np.ndarray) -> "RiskThresholds":
+        """Determine thresholds adaptively using KMeans clustering."""
+        unique = np.unique(scores)
+        if len(unique) < 3:
+            log.warning("%d unique CF values — using default thresholds", len(unique))
+            return cls()
+
+        n_clusters = min(3, len(unique))
+        kmeans = KMeans(n_clusters=n_clusters, n_init=10, random_state=42).fit(scores.reshape(-1, 1))
+        centers = sorted(kmeans.cluster_centers_.flatten())
+
+        if len(centers) >= 3:
+            low = centers[0] + (centers[1] - centers[0]) * 0.4
+            medium = centers[1] + (centers[2] - centers[1]) * 0.6
+        elif len(centers) == 2:
+            low = centers[0] + (centers[1] - centers[0]) * 0.3
+            medium = centers[0] + (centers[1] - centers[0]) * 0.7
         else:
-            return 'rendah' if skor < self.thresholds['sedang'] else 'sedang'
+            return cls()
 
-    def train_xgboost(self, df):
-        print("\n🌳 Melatih model XGBoost...")
+        result = cls(low=float(low), medium=float(medium))
+        log.info("Adaptive thresholds — low=%.3f, medium=%.3f", result.low, result.medium)
+        return result
 
-        try:
-            if 'label_binary' not in df.columns:
-                print("❌ Kolom 'label_binary' tidak ditemukan")
-                return False
+    def classify(self, score: float, buffer: float = 0.05) -> str:
+        """Map a CF score to a risk level string."""
+        if score < self.low - buffer:
+            return "rendah"
+        elif self.low + buffer <= score < self.medium - buffer:
+            return "sedang"
+        elif score >= self.medium + buffer:
+            return "tinggi"
+        else:
+            return "rendah" if score < self.medium else "sedang"
 
-            drop_cols = ['label', 'label_binary', 'cf_score', 'tingkat_risiko'] + self.fitur_dihapus
-            available_cols = [col for col in drop_cols if col in df.columns]
 
-            X = df.drop(available_cols, axis=1, errors='ignore')
-            y = df['label_binary']
+# ---------------------------------------------------------------------------
+# Data preprocessing
+# ---------------------------------------------------------------------------
 
-            # Encode categorical columns
-            categorical_cols = X.select_dtypes(include=['object']).columns.tolist()
-            for col in categorical_cols:
-                le = LabelEncoder()
-                X[col] = le.fit_transform(X[col].astype(str))
-                self.label_encoders[col] = le
+def load_dataset(path: str) -> Optional[pd.DataFrame]:
+    """Load a CSV dataset with basic validation."""
+    if not os.path.exists(path):
+        log.error("File not found: %s", path)
+        return None
+    try:
+        df = pd.read_csv(path)
+        log.info("Loaded %s — %d rows, %d columns", path, len(df), len(df.columns))
+        return df
+    except Exception as exc:
+        log.error("Failed to load dataset: %s", exc)
+        return None
 
-            self.xgb_model = XGBClassifier(
-                n_estimators=100,
-                max_depth=3,
-                learning_rate=0.1,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                random_state=42,
-                eval_metric='logloss',
-                use_label_encoder=False,
-                tree_method='hist',
-                gamma=0.1,
-                reg_alpha=0.5,
-                reg_lambda=1
+
+def preprocess(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Clean and transform raw network data.
+
+    * Drops high-cardinality / uninformative columns
+    * Log-normalises large numeric values
+    * Encodes categorical strings
+    * Engineers interaction features
+    """
+    log.info("Preprocessing %d rows...", len(df))
+
+    # Drop unwanted columns
+    existing = [c for c in COLUMNS_TO_DROP if c in df.columns]
+    if existing:
+        df = df.drop(columns=existing)
+        log.info("Dropped %d uninformative columns", len(existing))
+
+    # Numeric columns
+    for col in NUMERIC_COLUMNS:
+        if col not in df.columns:
+            continue
+        df[col] = pd.to_numeric(df[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        if df[col].max() > 1e6:
+            df[col] = np.log1p(df[col])
+            log.info("Log-transformed '%s' (skewed)", col)
+        df[col] = df[col].fillna(0)
+
+    # Categorical clean-up
+    for col in CATEGORICAL_COLUMNS:
+        if col not in df.columns:
+            continue
+        df[col] = df[col].astype(str).str.strip().str.lower().replace("nan", "unknown")
+
+    # Feature engineering
+    if "src_bytes" in df.columns and "dst_bytes" in df.columns:
+        df["bytes_ratio"] = np.log1p(df["src_bytes"] / (df["dst_bytes"] + 1))
+    if all(c in df.columns for c in ["duration", "src_bytes", "dst_bytes"]):
+        df["packet_rate"] = df["duration"] / (df["src_bytes"] + df["dst_bytes"] + 1)
+
+    log.info("Preprocessing complete — %d columns", len(df.columns))
+    return df
+
+
+def encode_categoricals(
+    df: pd.DataFrame,
+    encoders: Optional[Dict[str, LabelEncoder]] = None,
+    fit: bool = True,
+) -> Tuple[pd.DataFrame, Dict[str, LabelEncoder]]:
+    """
+    Label-encode categorical columns.
+
+    Parameters
+    ----------
+    df : DataFrame
+        Data to encode.
+    encoders : dict or None
+        Pre-fitted encoders to reuse (when *fit* is False).
+    fit : bool
+        If True, fit new encoders; otherwise transform using existing ones.
+
+    Returns
+    -------
+    (DataFrame, dict of encoders)
+    """
+    if encoders is None:
+        encoders = {}
+
+    cat_cols = df.select_dtypes(include=["object"]).columns.tolist()
+    df = df.copy()
+
+    for col in cat_cols:
+        if fit:
+            le = LabelEncoder()
+            df[col] = le.fit_transform(df[col].astype(str))
+            encoders[col] = le
+        else:
+            le = encoders.get(col)
+            if le is None:
+                continue
+            # Handle unknown categories gracefully
+            df[col] = df[col].astype(str).map(
+                lambda x: x if x in le.classes_ else "unknown"
             )
+            # If "unknown" wasn't in training classes, add it
+            if "unknown" not in le.classes_:
+                classes = list(le.classes_) + ["unknown"]
+                le.classes_ = np.array(classes)
+            df[col] = le.transform(df[col])
 
-            scores = cross_val_score(
-                self.xgb_model, X, y,
-                cv=5,
-                scoring='accuracy',
-                n_jobs=-1
-            )
-            print(f"✅ Cross-val XGBoost: {np.mean(scores):.4f} ± {np.std(scores):.4f}")
-
-            self.xgb_model.fit(X, y)
-            return True
-        except Exception as e:
-            print(f"❌ Error training XGBoost: {str(e)}")
-            traceback.print_exc()
-            return False
-
-    def train_hybrid_model(self, df):
-        print("\n🤖 Melatih model hybrid CF + XGBoost...")
-
-        try:
-            if 'cf_score' not in df.columns:
-                df['cf_score'] = self.hitung_cf_paralel(df)
-
-            if self.xgb_model is None:
-                if not self.train_xgboost(df):
-                    raise Exception("XGBoost training failed")
-
-            drop_cols = ['label', 'label_binary', 'cf_score', 'tingkat_risiko'] + self.fitur_dihapus
-            available_cols = [col for col in drop_cols if col in df.columns]
-
-            X = df.drop(available_cols, axis=1, errors='ignore')
-            y = df['label_binary']
-
-            for col, le in self.label_encoders.items():
-                if col in X.columns:
-                    X[col] = le.transform(X[col].astype(str))
-
-            xgb_pred = self.xgb_model.predict_proba(X)[:, 1]
-            X_hybrid = np.column_stack([xgb_pred, df['cf_score']])
-
-            X_train, X_val, y_train, y_val = train_test_split(
-                X_hybrid, y, test_size=0.2, random_state=42, stratify=y)
-
-            self.hybrid_model = XGBClassifier(
-                n_estimators=50,
-                max_depth=2,
-                learning_rate=0.05,
-                random_state=42,
-                eval_metric='logloss',
-                use_label_encoder=False,
-                subsample=0.7,
-                colsample_bytree=0.7
-            )
-
-            self.hybrid_model.fit(X_train, y_train)
-
-            y_pred = self.hybrid_model.predict(X_val)
-            accuracy = accuracy_score(y_val, y_pred)
-            balanced_acc = balanced_accuracy_score(y_val, y_pred)
-            mcc = matthews_corrcoef(y_val, y_pred)
-
-            print(f"✅ Hybrid: acc={accuracy:.4f}, balanced_acc={balanced_acc:.4f}, mcc={mcc:.4f}")
-            return True
-        except Exception as e:
-            print(f"❌ Error training hybrid: {str(e)}")
-            traceback.print_exc()
-            self.hybrid_model = None
-            return False
-
-    def analisis_feature_importance(self, X):
-        if self.xgb_model is None:
-            return False
-
-        importance = self.xgb_model.feature_importances_
-        feature_importance = pd.DataFrame({
-            'feature': X.columns,
-            'importance': importance
-        }).sort_values('importance', ascending=False)
-
-        high_impact_features = feature_importance[feature_importance['importance'] > 0.3]
-        if not high_impact_features.empty:
-            print("⚠️ Fitur dominan terdeteksi (mungkin overfitting):")
-            print(high_impact_features)
-            for fitur in high_impact_features['feature']:
-                if fitur not in self.fitur_dihapus:
-                    print(f"  - Menghapus fitur: {fitur}")
-                    self.fitur_dihapus.append(fitur)
-            return True
-        return False
-
-    # --- Plotting methods ---
-
-    def plot_cf_distribution(self, df):
-        plt.figure(figsize=(10, 6))
-        for level, color in [('rendah', 'green'), ('sedang', 'orange'), ('tinggi', 'red')]:
-            subset = df[df['tingkat_risiko'] == level]
-            if len(subset) > 0:
-                sns.kdeplot(subset['cf_score'], label=level.capitalize(),
-                           color=color, fill=True)
-        plt.axvline(self.thresholds['rendah'], color='blue', linestyle='--', label='Batas Rendah')
-        plt.axvline(self.thresholds['sedang'], color='purple', linestyle='--', label='Batas Sedang')
-        plt.title('Distribusi Skor CF per Tingkat Risiko')
-        plt.xlabel('Skor CF')
-        plt.legend()
-        plt.savefig('cf_distribution.png', dpi=300, bbox_inches='tight')
-        plt.close()
-        print("✅ cf_distribution.png")
-
-    def plot_risk_distribution(self, df):
-        plt.figure(figsize=(8, 6))
-        risk_dist = df['tingkat_risiko'].value_counts()
-        colors = {'rendah': 'green', 'sedang': 'orange', 'tinggi': 'red'}
-        plt.pie(risk_dist, labels=risk_dist.index,
-                colors=[colors[x] for x in risk_dist.index],
-                autopct='%1.1f%%', startangle=90,
-                wedgeprops={'linewidth': 1, 'edgecolor': 'white'})
-        plt.title('Persentase Tingkat Risiko')
-        plt.savefig('risk_distribution.png', dpi=300, bbox_inches='tight')
-        plt.close()
-        print("✅ risk_distribution.png")
-
-    def plot_confusion_matrix(self, y_true, y_pred, model_name, filename):
-        plt.figure(figsize=(8, 6))
-        cm = confusion_matrix(y_true, y_pred)
-        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                   xticklabels=['Normal', 'Serangan'],
-                   yticklabels=['Normal', 'Serangan'])
-        plt.title(f'Confusion Matrix - {model_name}')
-        plt.xlabel('Prediksi')
-        plt.ylabel('Aktual')
-        plt.savefig(filename, dpi=300, bbox_inches='tight')
-        plt.close()
-        print(f"✅ {filename}")
-
-    def plot_roc_curve(self, df):
-        plt.figure(figsize=(10, 8))
-        if 'cf_score' in df.columns and 'label_binary' in df.columns:
-            fpr_cf, tpr_cf, _ = roc_curve(df['label_binary'], df['cf_score'])
-            roc_auc_cf = auc(fpr_cf, tpr_cf)
-            plt.plot(fpr_cf, tpr_cf, label=f'CF (AUC = {roc_auc_cf:.2f})', linewidth=2)
-        if 'prob_xgb' in df.columns and 'label_binary' in df.columns:
-            fpr_xgb, tpr_xgb, _ = roc_curve(df['label_binary'], df['prob_xgb'])
-            roc_auc_xgb = auc(fpr_xgb, tpr_xgb)
-            plt.plot(fpr_xgb, tpr_xgb, label=f'XGBoost (AUC = {roc_auc_xgb:.2f})', linewidth=2)
-        if 'prob_hybrid' in df.columns and 'label_binary' in df.columns:
-            fpr_hybrid, tpr_hybrid, _ = roc_curve(df['label_binary'], df['prob_hybrid'])
-            roc_auc_hybrid = auc(fpr_hybrid, tpr_hybrid)
-            plt.plot(fpr_hybrid, tpr_hybrid, label=f'Hybrid (AUC = {roc_auc_hybrid:.2f})', linewidth=2)
-        plt.plot([0, 1], [0, 1], 'k--')
-        plt.xlim([0.0, 1.0])
-        plt.ylim([0.0, 1.05])
-        plt.xlabel('False Positive Rate')
-        plt.ylabel('True Positive Rate')
-        plt.title('Perbandingan Kurva ROC')
-        plt.legend(loc="lower right")
-        plt.savefig('roc_curves.png', dpi=300, bbox_inches='tight')
-        plt.close()
-        print("✅ roc_curves.png")
-
-    def plot_feature_importance(self):
-        if self.xgb_model is None:
-            return
-        plt.figure(figsize=(12, 8))
-        plot_importance(self.xgb_model, importance_type='weight')
-        plt.title('Feature Importance XGBoost')
-        plt.savefig('feature_importance.png', dpi=300, bbox_inches='tight')
-        plt.close()
-        print("✅ feature_importance.png")
-
-    def plot_score_comparison(self, df):
-        if 'prob_xgb' not in df.columns or 'cf_score' not in df.columns or 'label_binary' not in df.columns:
-            return
-        plt.figure(figsize=(12, 8))
-        sample = df.sample(1000) if len(df) > 1000 else df
-        sns.scatterplot(x='prob_xgb', y='cf_score', hue='label_binary',
-                       data=sample, alpha=0.6)
-        plt.title('Perbandingan Skor XGBoost vs CF')
-        plt.xlabel('Probabilitas XGBoost')
-        plt.ylabel('Skor CF')
-        plt.savefig('score_comparison.png', dpi=300, bbox_inches='tight')
-        plt.close()
-        print("✅ score_comparison.png")
-
-    def evaluasi_model(self, df):
-        print("\n📈 Evaluasi hasil...")
-
-        try:
-            # Evaluasi CF
-            if 'cf_score' in df.columns and 'label_binary' in df.columns:
-                print("\n=== Evaluasi Certainty Factor ===")
-                precision, recall, thresholds = precision_recall_curve(df['label_binary'], df['cf_score'])
-                f1_scores = 2 * (precision * recall) / (precision + recall + 1e-9)
-                optimal_idx = np.argmax(f1_scores)
-                optimal_threshold = thresholds[optimal_idx]
-
-                df['predicted_cf'] = (df['cf_score'] >= optimal_threshold).astype(int)
-
-                cm_cf = confusion_matrix(df['label_binary'], df['predicted_cf'])
-                akurasi_cf = accuracy_score(df['label_binary'], df['predicted_cf'])
-                balanced_acc_cf = balanced_accuracy_score(df['label_binary'], df['predicted_cf'])
-                mcc_cf = matthews_corrcoef(df['label_binary'], df['predicted_cf'])
-
-                print(f"Threshold optimal CF: {optimal_threshold:.4f}")
-                print(f"Akurasi CF: {akurasi_cf * 100:.2f}%")
-                print(f"Balanced Accuracy CF: {balanced_acc_cf * 100:.2f}%")
-                print(f"MCC CF: {mcc_cf:.4f}")
-                print("Confusion Matrix CF:")
-                print(cm_cf)
-                print(classification_report(df['label_binary'], df['predicted_cf'],
-                                          target_names=['normal', 'serangan'], zero_division=0))
-
-                self.plot_cf_distribution(df)
-                self.plot_risk_distribution(df)
-                self.plot_confusion_matrix(df['label_binary'], df['predicted_cf'],
-                                         'Certainty Factor', 'cf_confusion_matrix.png')
-
-            # Evaluasi XGBoost
-            if self.xgb_model is not None and 'label_binary' in df.columns:
-                print("\n=== Evaluasi XGBoost ===")
-
-                drop_cols = ['label', 'label_binary', 'cf_score', 'predicted_cf', 'tingkat_risiko'] + self.fitur_dihapus
-                available_cols = [col for col in drop_cols if col in df.columns]
-
-                X = df.drop(available_cols, axis=1, errors='ignore')
-
-                for col, le in self.label_encoders.items():
-                    if col in X.columns:
-                        try:
-                            X[col] = le.transform(X[col].astype(str))
-                        except ValueError:
-                            X[col] = X[col].apply(lambda x: x if x in le.classes_ else 'unknown')
-                            X[col] = le.transform(X[col])
-
-                df['predicted_xgb'] = self.xgb_model.predict(X)
-                df['prob_xgb'] = self.xgb_model.predict_proba(X)[:, 1]
-
-                cm_xgb = confusion_matrix(df['label_binary'], df['predicted_xgb'])
-                akurasi_xgb = accuracy_score(df['label_binary'], df['predicted_xgb'])
-                balanced_acc_xgb = balanced_accuracy_score(df['label_binary'], df['predicted_xgb'])
-                mcc_xgb = matthews_corrcoef(df['label_binary'], df['predicted_xgb'])
-
-                print(f"Akurasi XGBoost: {akurasi_xgb * 100:.2f}%")
-                print(f"Balanced Accuracy XGBoost: {balanced_acc_xgb * 100:.2f}%")
-                print(f"MCC XGBoost: {mcc_xgb:.4f}")
-                print("Confusion Matrix XGBoost:")
-                print(cm_xgb)
-                print(classification_report(df['label_binary'], df['predicted_xgb'],
-                                          target_names=['normal', 'serangan'], zero_division=0))
-
-                if self.analisis_feature_importance(X):
-                    print("⚠️ Overfitting terdeteksi, melatih ulang tanpa fitur dominan...")
-                    self.train_xgboost(df)
-
-                self.plot_confusion_matrix(df['label_binary'], df['predicted_xgb'],
-                                         'XGBoost', 'xgb_confusion_matrix.png')
-                self.plot_feature_importance()
-
-            # Evaluasi Hybrid
-            if (self.hybrid_model is not None and
-                'prob_xgb' in df.columns and
-                'cf_score' in df.columns and
-                'label_binary' in df.columns):
-                print("\n=== Evaluasi Hybrid Model ===")
-                hybrid_features = np.column_stack([df['prob_xgb'], df['cf_score']])
-
-                df['predicted_hybrid'] = self.hybrid_model.predict(hybrid_features)
-                df['prob_hybrid'] = self.hybrid_model.predict_proba(hybrid_features)[:, 1]
-
-                cm_hybrid = confusion_matrix(df['label_binary'], df['predicted_hybrid'])
-                akurasi_hybrid = accuracy_score(df['label_binary'], df['predicted_hybrid'])
-                balanced_acc_hybrid = balanced_accuracy_score(df['label_binary'], df['predicted_hybrid'])
-                mcc_hybrid = matthews_corrcoef(df['label_binary'], df['predicted_hybrid'])
-
-                print(f"Akurasi Hybrid: {akurasi_hybrid * 100:.2f}%")
-                print(f"Balanced Accuracy Hybrid: {balanced_acc_hybrid * 100:.2f}%")
-                print(f"MCC Hybrid: {mcc_hybrid:.4f}")
-                print("Confusion Matrix Hybrid:")
-                print(cm_hybrid)
-                print(classification_report(df['label_binary'], df['predicted_hybrid'],
-                                          target_names=['normal', 'serangan'], zero_division=0))
-
-                self.plot_confusion_matrix(df['label_binary'], df['predicted_hybrid'],
-                                         'Hybrid Model', 'hybrid_confusion_matrix.png')
-
-            self.plot_roc_curve(df)
-            self.plot_score_comparison(df)
-
-            return True
-        except Exception as e:
-            print(f"❌ Error evaluasi: {str(e)}")
-            traceback.print_exc()
-            return False
+    return df, encoders
 
 
-def main():
-    parser = argparse.ArgumentParser(description='Deteksi Serangan dengan CF, XGBoost, dan Hybrid')
-    parser.add_argument('dataset', nargs='?', default='train_test_network.csv',
-                       help='Path ke dataset CSV (default: train_test_network.csv)')
+# ---------------------------------------------------------------------------
+# Plotting helpers
+# ---------------------------------------------------------------------------
+
+def plot_cf_distribution(
+    df: pd.DataFrame,
+    thresholds: RiskThresholds,
+    save_path: str = "output/cf_distribution.png",
+) -> None:
+    """KDE of CF scores per risk level."""
+    plt.figure(figsize=(10, 6))
+    for level, color in [("rendah", "green"), ("sedang", "orange"), ("tinggi", "red")]:
+        subset = df[df["tingkat_risiko"] == level]
+        if not subset.empty:
+            sns.kdeplot(subset["cf_score"], label=level.capitalize(), color=color, fill=True)
+    plt.axvline(thresholds.low, color="blue", linestyle="--", label="Low boundary")
+    plt.axvline(thresholds.medium, color="purple", linestyle="--", label="Medium boundary")
+    plt.title("CF Score Distribution by Risk Level")
+    plt.xlabel("CF Score")
+    plt.ylabel("Density")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+    log.info("Saved %s", save_path)
+
+
+def plot_risk_distribution(df: pd.DataFrame, save_path: str = "output/risk_distribution.png") -> None:
+    """Pie chart of predicted risk levels."""
+    dist = df["tingkat_risiko"].value_counts()
+    colors = {"rendah": "green", "sedang": "orange", "tinggi": "red"}
+    plt.figure(figsize=(8, 6))
+    plt.pie(
+        dist,
+        labels=dist.index,
+        colors=[colors.get(lvl, "gray") for lvl in dist.index],
+        autopct="%1.1f%%",
+        startangle=90,
+        wedgeprops={"linewidth": 1, "edgecolor": "white"},
+    )
+    plt.title("Risk Level Distribution")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+    log.info("Saved %s", save_path)
+
+
+def plot_confusion_matrix(
+    y_true: pd.Series,
+    y_pred: pd.Series,
+    model_name: str,
+    save_path: str,
+) -> None:
+    """Confusion matrix heatmap."""
+    cm = confusion_matrix(y_true, y_pred)
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(
+        cm, annot=True, fmt="d", cmap="Blues",
+        xticklabels=["Normal", "Attack"],
+        yticklabels=["Normal", "Attack"],
+    )
+    plt.title(f"Confusion Matrix — {model_name}")
+    plt.xlabel("Predicted")
+    plt.ylabel("Actual")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+    log.info("Saved %s", save_path)
+
+
+def plot_roc_curves(
+    df: pd.DataFrame,
+    save_path: str = "output/roc_curves.png",
+) -> None:
+    """Overlaid ROC curves for all available models."""
+    plt.figure(figsize=(10, 8))
+    for key, label, color in [
+        ("cf_score", "CF", "blue"),
+        ("prob_xgb", "XGBoost", "green"),
+        ("prob_hybrid", "Hybrid", "red"),
+    ]:
+        if key in df.columns and "label_binary" in df.columns:
+            fpr, tpr, _ = roc_curve(df["label_binary"], df[key])
+            roc_auc = auc(fpr, tpr)
+            plt.plot(fpr, tpr, label=f"{label} (AUC = {roc_auc:.2f})", linewidth=2, color=color)
+
+    plt.plot([0, 1], [0, 1], "k--", alpha=0.5)
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title("ROC Curves Comparison")
+    plt.legend(loc="lower right")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+    log.info("Saved %s", save_path)
+
+
+def plot_score_comparison(df: pd.DataFrame, save_path: str = "output/score_comparison.png") -> None:
+    """Scatter plot of XGBoost probability vs CF score."""
+    if not all(c in df.columns for c in ["prob_xgb", "cf_score", "label_binary"]):
+        return
+    sample = df.sample(min(1000, len(df)))
+    plt.figure(figsize=(12, 8))
+    sns.scatterplot(
+        x="prob_xgb", y="cf_score", hue="label_binary",
+        data=sample, alpha=0.6, palette={0: "green", 1: "red"},
+    )
+    plt.title("XGBoost Probability vs CF Score")
+    plt.xlabel("XGBoost Probability")
+    plt.ylabel("CF Score")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+    log.info("Saved %s", save_path)
+
+
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
+
+def evaluate_model(
+    y_true: pd.Series,
+    y_score: pd.Series,
+    model_name: str,
+) -> Dict[str, Any]:
+    """Compute standard classification metrics."""
+    precision, recall, thresholds = precision_recall_curve(y_true, y_score)
+    f1 = 2 * (precision * recall) / (precision + recall + 1e-9)
+    best_idx = np.argmax(f1)
+    best_threshold = thresholds[best_idx] if len(thresholds) > best_idx else 0.5
+
+    y_pred = (y_score >= best_threshold).astype(int)
+
+    return {
+        "model": model_name,
+        "threshold": float(best_threshold),
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
+        "mcc": float(matthews_corrcoef(y_true, y_pred)),
+        "confusion_matrix": confusion_matrix(y_true, y_pred).tolist(),
+        "y_pred": y_pred,
+    }
+
+
+def print_metrics(result: Dict[str, Any]) -> None:
+    """Pretty-print evaluation metrics."""
+    log.info("── %s ──", result["model"])
+    log.info("  Optimal threshold:   %.4f", result["threshold"])
+    log.info("  Accuracy:            %.2f%%", result["accuracy"] * 100)
+    log.info("  Balanced Accuracy:   %.2f%%", result["balanced_accuracy"] * 100)
+    log.info("  MCC:                 %.4f", result["mcc"])
+    cm = result["confusion_matrix"]
+    log.info("  Confusion Matrix:")
+    log.info("    TN=%d  FP=%d", cm[0][0], cm[0][1])
+    log.info("    FN=%d  TP=%d", cm[1][0], cm[1][1])
+
+
+# ---------------------------------------------------------------------------
+# Main pipeline
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Network Anomaly Detection — CF + XGBoost + Hybrid"
+    )
+    parser.add_argument(
+        "--dataset", "-d",
+        default="train_test_network.csv",
+        help="Path to training CSV dataset (default: train_test_network.csv)",
+    )
+    parser.add_argument(
+        "--test-size", "-t",
+        type=float,
+        default=0.2,
+        help="Fraction of data held out for final evaluation (default: 0.2)",
+    )
+    parser.add_argument(
+        "--output", "-o",
+        default="output",
+        help="Output directory for plots and results (default: output/)",
+    )
     args = parser.parse_args()
 
-    sistem = SistemDeteksiAnomali()
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    df = sistem.muat_data(args.dataset)
+    log.info("=" * 50)
+    log.info("Network Anomaly Detection Pipeline")
+    log.info("  Dataset:   %s", args.dataset)
+    log.info("  Test size: %.2f", args.test_size)
+    log.info("  Output:    %s/", output_dir)
+    log.info("=" * 50)
+
+    # 1. Load & preprocess ----------------------------------------------------
+    df = load_dataset(args.dataset)
     if df is None:
-        exit(1)
+        sys.exit(1)
 
-    df = sistem.praproses_data(df)
-    if df is None:
-        exit(1)
+    df = preprocess(df)
+    if "label" not in df.columns:
+        log.error("Column 'label' not found — cannot continue")
+        sys.exit(1)
 
-    if 'label' not in df.columns:
-        print("❌ Kolom 'label' tidak ditemukan")
-        exit(1)
+    df["label"] = df["label"].astype(str).str.lower().str.strip()
+    df["label_binary"] = df["label"].apply(lambda x: 1 if x in LABEL_ATTACK_VALUES else 0)
 
-    df['label'] = df['label'].astype(str).str.lower().str.strip()
-    df['label_binary'] = df['label'].apply(
-        lambda x: 1 if x in ['attack', 'malicious', '1', 'true'] else 0)
+    # Verify both classes exist
+    if df["label_binary"].nunique() < 2:
+        log.error("Dataset must contain both normal and attack samples")
+        sys.exit(1)
 
-    sistem.bangun_basis_pengetahuan(df)
+    attack_pct = df["label_binary"].mean() * 100
+    log.info("Class balance: %.1f%% normal, %.1f%% attack", 100 - attack_pct, attack_pct)
 
-    skor_cf = sistem.hitung_cf_paralel(df)
-    if skor_cf is None:
-        exit(1)
-    df['cf_score'] = skor_cf
+    # 2. Train/Test split ----------------------------------------------------
+    # IMPORTANT: Split FIRST to prevent data leakage across the pipeline.
+    drop_cols = ["label", "label_binary", "cf_score", "tingkat_risiko"]
+    X = df.drop(columns=[c for c in drop_cols if c in df.columns], errors="ignore")
+    y = df["label_binary"]
 
-    sistem.tentukan_threshold(df['cf_score'])
-    df['tingkat_risiko'] = df['cf_score'].apply(sistem.klasifikasi_risiko)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=args.test_size, random_state=42, stratify=y,
+    )
 
-    sistem.train_xgboost(df)
-    sistem.train_hybrid_model(df)
+    # Reconstruct full DataFrames for convenience
+    train_idx = X_train.index
+    test_idx = X_test.index
+    df_train = df.loc[train_idx].copy()
+    df_test = df.loc[test_idx].copy()
 
-    print("\n🔎 Distribusi Tingkat Risiko:")
-    if 'tingkat_risiko' in df.columns:
-        risk_dist = df['tingkat_risiko'].value_counts()
-        for level in ['rendah', 'sedang', 'tinggi']:
-            if level in risk_dist.index:
-                count = risk_dist[level]
-                print(f"  - {level.capitalize()}: {count} ({count/len(df)*100:.1f}%)")
+    log.info("Train: %d rows | Test: %d rows", len(df_train), len(df_test))
 
-    sistem.evaluasi_model(df)
+    # 3. Encode categoricals --------------------------------------------------
+    df_train, encoders = encode_categoricals(df_train, fit=True)
+    df_test, _ = encode_categoricals(df_test, encoders=encoders, fit=False)
 
-    output_file = 'hasil_prediksi_enhanced.csv'
-    df.to_csv(output_file, index=False)
-    print(f"\n💾 Hasil disimpan: {output_file}")
-    print("🎉 Selesai!")
+    # 4. CF Engine — build from TRAIN only ------------------------------------
+    cf_engine = CFEngine.build_from_data(df_train)
+    rules_df = pd.DataFrame([
+        {"kolom": r.column, "kondisi": f"{r.column} {r.operator} {r.value}",
+         "mb": r.mb, "md": r.md}
+        for r in cf_engine.rules
+    ])
+    if not rules_df.empty:
+        rules_df.to_csv(output_dir / "basis_pengetahuan_otomatis.csv", index=False)
+        log.info("Saved %d rules to basis_pengetahuan_otomatis.csv", len(rules_df))
+
+    # 5. CF scoring (train + test) -------------------------------------------
+    with log.info("Scoring training set with CF..."):
+        df_train["cf_score"] = cf_engine.score_bulk(df_train)
+    with log.info("Scoring test set with CF..."):
+        df_test["cf_score"] = cf_engine.score_bulk(df_test)
+
+    # Adaptive thresholds from TRAIN scores only
+    thresholds = RiskThresholds.from_scores(df_train["cf_score"].values)
+    df_train["tingkat_risiko"] = df_train["cf_score"].apply(thresholds.classify)
+    df_test["tingkat_risiko"] = df_test["cf_score"].apply(thresholds.classify)
+
+    # 6. XGBoost — train on TRAIN only --------------------------------------
+    train_cols = [c for c in drop_cols if c in df_train.columns]
+    X_train_xgb = df_train.drop(columns=train_cols, errors="ignore")
+
+    xgb_model = XGBClassifier(**XGB_PARAMS)
+    xgb_model.fit(X_train_xgb, y_train)
+
+    # Predict on both splits
+    X_test_xgb = df_test.drop(columns=[c for c in drop_cols + ["predicted_cf", "predicted_xgb", "predicted_hybrid"]
+                                        if c in df_test.columns], errors="ignore")
+    df_train["predicted_xgb"] = xgb_model.predict(X_train_xgb)
+    df_train["prob_xgb"] = xgb_model.predict_proba(X_train_xgb)[:, 1]
+    df_test["predicted_xgb"] = xgb_model.predict(X_test_xgb)
+    df_test["prob_xgb"] = xgb_model.predict_proba(X_test_xgb)[:, 1]
+
+    # 7. Hybrid model — train on TRAIN only ----------------------------------
+    hybrid_features_train = np.column_stack([df_train["prob_xgb"], df_train["cf_score"]])
+    hybrid_features_test = np.column_stack([df_test["prob_xgb"], df_test["cf_score"]])
+
+    hybrid_model = XGBClassifier(**HYBRID_PARAMS)
+    hybrid_model.fit(hybrid_features_train, y_train)
+
+    df_train["predicted_hybrid"] = hybrid_model.predict(hybrid_features_train)
+    df_train["prob_hybrid"] = hybrid_model.predict_proba(hybrid_features_train)[:, 1]
+    df_test["predicted_hybrid"] = hybrid_model.predict(hybrid_features_test)
+    df_test["prob_hybrid"] = hybrid_model.predict_proba(hybrid_features_test)[:, 1]
+
+    # 8. Evaluate ALL models on the TEST set only ---------------------------
+    log.info("\n" + "=" * 50)
+    log.info("FINAL EVALUATION (test set — %.0f rows)", len(df_test))
+    log.info("=" * 50)
+
+    # CF
+    log.info("")
+    metrics_cf = evaluate_model(y_test, df_test["cf_score"], "Certainty Factor")
+    print_metrics(metrics_cf)
+    plot_confusion_matrix(y_test, metrics_cf["y_pred"], "CF", str(output_dir / "cf_confusion_matrix.png"))
+
+    # XGBoost
+    log.info("")
+    metrics_xgb = evaluate_model(y_test, df_test["prob_xgb"], "XGBoost")
+    print_metrics(metrics_xgb)
+    plot_confusion_matrix(y_test, metrics_xgb["y_pred"], "XGBoost", str(output_dir / "xgb_confusion_matrix.png"))
+
+    # Hybrid
+    if hybrid_model is not None:
+        log.info("")
+        metrics_h = evaluate_model(y_test, df_test["prob_hybrid"], "Hybrid")
+        print_metrics(metrics_h)
+        plot_confusion_matrix(y_test, metrics_h["y_pred"], "Hybrid", str(output_dir / "hybrid_confusion_matrix.png"))
+
+    # Shared plots
+    plot_cf_distribution(df_test, thresholds, str(output_dir / "cf_distribution.png"))
+    plot_risk_distribution(df_test, str(output_dir / "risk_distribution.png"))
+    plot_roc_curves(df_test, str(output_dir / "roc_curves.png"))
+    plot_score_comparison(df_test, str(output_dir / "score_comparison.png"))
+
+    # Feature importance
+    fig, ax = plt.subplots(figsize=(12, 8))
+    plot_importance(xgb_model, importance_type="weight", ax=ax)
+    ax.set_title("XGBoost Feature Importance")
+    fig.tight_layout()
+    fig.savefig(output_dir / "feature_importance.png", dpi=300)
+    plt.close()
+    log.info("Saved feature_importance.png")
+
+    # 9. Save results ---------------------------------------------------------
+    df_test.to_csv(output_dir / "hasil_prediksi_enhanced.csv", index=False)
+    log.info("\nResults saved to %s/hasil_prediksi_enhanced.csv", output_dir)
+    log.info("All charts saved to %s/", output_dir)
+    log.info("=" * 50)
+    log.info("Pipeline complete!")
+    log.info("=" * 50)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

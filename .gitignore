@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.so
+
+# Data (user-supplied, not tracked)
+*.csv
+!output/
+
+# Plots (generated at runtime)
+output/
+!output/.gitkeep
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# OS files
+.DS_Store
+Thumbs.db
+*.swp
+
+# Editor
+.idea/
+.vscode/
+
+# Environments
+.env
+venv/
+.venv/
