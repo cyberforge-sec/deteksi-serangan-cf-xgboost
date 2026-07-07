@@ -484,7 +484,7 @@ def encode_categoricals(
     if encoders is None:
         encoders = {}
 
-    cat_cols = df.select_dtypes(include=["object"]).columns.tolist()
+    cat_cols = df.select_dtypes(include=["object", "str"]).columns.tolist()
     df = df.copy()
 
     for col in cat_cols:
